@@ -29,6 +29,16 @@ enum RobotCommand : uint8_t {
 struct LegInfo { uint8_t hip, thigh, knee; bool isRight; float ox, oy; };
 struct BleCmd  { const char *keys; RobotCommand cmd; const char *name; };
 
+// Redraws only when the text changes (keeps I2C traffic low)
+void lcdPrint(const char *a, const char *b) {
+  static char la[17] = "", lb[17] = "";
+  if (!strcmp(a, la) && !strcmp(b, lb)) return;
+  strncpy(la, a, 16); strncpy(lb, b, 16);
+  char buf[17];
+  lcd.setCursor(0, 0); snprintf(buf, 17, "%-16s", a); lcd.print(buf);
+  lcd.setCursor(0, 1); snprintf(buf, 17, "%-16s", b); lcd.print(buf);
+}
+
 // ---- Hardware ----
 Adafruit_PWMServoDriver pca(0x40);
 MPU6050 mpu(Wire);
@@ -315,6 +325,7 @@ void omniTrot(float SH, float vx, float vy, float wz, float height){
 void doHandshake() {
 
   handshakeActive = true;
+  lcdPrint("HANDSHAKE", "Shaking hand...");
   delay(200);
   applyPRY(0,0,0, 150);
   delay(400);
@@ -344,6 +355,7 @@ void doHandshake() {
   applyPRY(0, 0, 0, 150);
   delay(200);
 
+  lcdPrint("HANDSHAKE", "Done");
   handshakeActive = false;
   robotCommand = CMD_STAND;
 }
@@ -650,6 +662,8 @@ void setup() {
   Serial.begin(115200);
   Serial.printf("Reset reason: %d\n", (int)esp_reset_reason());
   Wire.begin();
+  lcd.init(); lcd.backlight();
+  lcdPrint("SpotMicro", "Starting...");
   pca.begin();
   pca.setPWMFreq(50);
   moveAllLegs(X, Y, H);
@@ -657,12 +671,15 @@ void setup() {
   IBUS.begin(115200, SERIAL_8N1, IBUS_RX, -1);
   if (mpu.begin() != 0) {
     Serial.println("MPU6050 not found. Check wiring!");
+    lcdPrint("MPU6050", "Not found!");
   } else {
     Serial.println("Calibrating MPU6050, do not move...");
+    lcdPrint("Calibrating MPU", "Do not move...");
     delay(1000);
     mpu.calcOffsets();
     Serial.println("Done.");
   }
+  lcdPrint("SpotMicro", "Ready");
 }
 
 float axis(int v, float maxv){
@@ -673,8 +690,13 @@ float axis(int v, float maxv){
 void loop() {
   static int height = 150;                     // held when there is no signal
   static bool ch9Last = false;
+  static unsigned long lcdT = 0;
 
-  if (!ibusAlive()) { moveAllLegs(X, Y, H); return; }
+  if (!ibusAlive()) {
+    moveAllLegs(X, Y, H);
+    lcdPrint("NO SIGNAL", "Waiting for RC");
+    return;
+  }
 
   int c1 = ibusChannel(1), c2 = ibusChannel(2), c3 = ibusChannel(3),
       c4 = ibusChannel(4), c5 = ibusChannel(5);
@@ -699,6 +721,12 @@ void loop() {
   }
 
   height = map(constrain(c3, 1000, 2000), 1000, 2000, 100, 220);
+
+  if (millis() - lcdT > 150) {                 // limit LCD refresh to ~7 Hz
+    lcdT = millis();
+    char h[17]; snprintf(h, 17, "Height: %d", height);
+    lcdPrint(c5 >= 1500 ? "Trot Mode" : "Posture Mode", h);
+  }
 
   if (c5 >= 1500) {                            // gait mode
     float vx = axis(c2, 60);                   // forward / back

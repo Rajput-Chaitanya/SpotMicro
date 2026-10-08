@@ -29,6 +29,16 @@ enum RobotCommand : uint8_t {
 struct LegInfo { uint8_t hip, thigh, knee; bool isRight; float ox, oy; };
 struct BleCmd  { const char *keys; RobotCommand cmd; const char *name; };
 
+// Redraws only when the text changes (keeps I2C traffic low)
+void lcdPrint(const char *a, const char *b) {
+  static char la[17] = "", lb[17] = "";
+  if (!strcmp(a, la) && !strcmp(b, lb)) return;
+  strncpy(la, a, 16); strncpy(lb, b, 16);
+  char buf[17];
+  lcd.setCursor(0, 0); snprintf(buf, 17, "%-16s", a); lcd.print(buf);
+  lcd.setCursor(0, 1); snprintf(buf, 17, "%-16s", b); lcd.print(buf);
+}
+
 // ---- Hardware ----
 Adafruit_PWMServoDriver pca(0x40);
 MPU6050 mpu(Wire);
@@ -315,6 +325,7 @@ void omniTrot(float SH, float vx, float vy, float wz, float height){
 void doHandshake() {
 
   handshakeActive = true;
+  lcdPrint("HANDSHAKE", "Shaking hand...");
   delay(200);
   applyPRY(0,0,0, 150);
   delay(400);
@@ -344,6 +355,7 @@ void doHandshake() {
   applyPRY(0, 0, 0, 150);
   delay(200);
 
+  lcdPrint("HANDSHAKE", "Done");
   handshakeActive = false;
   robotCommand = CMD_STAND;
 }
@@ -650,6 +662,8 @@ void setup() {
   Serial.begin(115200);
   Serial.printf("Reset reason: %d\n", (int)esp_reset_reason());
   Wire.begin();
+  lcd.init(); lcd.backlight();
+  lcdPrint("SpotMicro", "Starting...");
   pca.begin();
   pca.setPWMFreq(50);
   moveAllLegs(X, Y, H);
@@ -657,12 +671,15 @@ void setup() {
   IBUS.begin(115200, SERIAL_8N1, IBUS_RX, -1);
   if (mpu.begin() != 0) {
     Serial.println("MPU6050 not found. Check wiring!");
+    lcdPrint("MPU6050", "Not found!");
   } else {
     Serial.println("Calibrating MPU6050, do not move...");
+    lcdPrint("Calibrating MPU", "Do not move...");
     delay(1000);
     mpu.calcOffsets();
     Serial.println("Done.");
   }
+  lcdPrint("SpotMicro", "Ready");
 }
 
 float axis(int v, float maxv){
@@ -673,8 +690,21 @@ float axis(int v, float maxv){
 void loop() {
   static int height = 150;                     // held when there is no signal
   static bool ch9Last = false;
+  static unsigned long lcdT = 0, tS = 0;
+  static float sP = 0, sR = 0, sY = 0, sHt = 150, sVx = 0, sVy = 0, sWz = 0;  // smoothed values
 
-  if (!ibusAlive()) { moveAllLegs(X, Y, H); return; }
+  float dt = min((millis() - tS) / 1000.0f, 0.05f); tS = millis();
+  static float tau = 0.2f;                     // smoothing time constant in seconds, set by CH10
+  int c10 = ibusChannel(10);
+  if (c10 > 900) tau = constrain(tau + axis(c10, 1.0f) * 0.3f * dt, 0.05f, 1.0f);  // push up = softer, down = snappier
+  float k = dt / (tau + dt);
+
+  if (!ibusAlive()) {
+    sP -= sP*k; sR -= sR*k; sY -= sY*k; sHt += (150 - sHt)*k; sVx = sVy = sWz = 0;
+    applyPRY(sP, sR, sY, sHt);                 // ease back to home pose
+    lcdPrint("NO SIGNAL", "Waiting for RC");
+    return;
+  }
 
   int c1 = ibusChannel(1), c2 = ibusChannel(2), c3 = ibusChannel(3),
       c4 = ibusChannel(4), c5 = ibusChannel(5);
@@ -694,23 +724,41 @@ void loop() {
   if (robotCommand == CMD_HANDSHAKE) {
     if (!handshakeActive) {
       doHandshake();
+      sP = sR = sY = sVx = sVy = sWz = 0; sHt = 150; tS = millis();   // continue smoothly from handshake end pose
     }
     return;
   }
 
   height = map(constrain(c3, 1000, 2000), 1000, 2000, 100, 220);
 
-  if (c5 >= 1500) {                            // gait mode
-    float vx = axis(c2, 60);                   // forward / back
-    float vy = axis(c1, 60);                   // strafe
-    float wz = axis(c4, 40);                   // rotate
-    float n = sqrt((vx/60)*(vx/60) + (vy/60)*(vy/60) + (wz/40)*(wz/40));
-    if (n > 1) { vx /= n; vy /= n; wz /= n; }  // keep the mix within limits
-    omniTrot(30, vx, vy, wz, height);
-  } else {                                     // posture mode
-    applyPRY(map(constrain(c2,1000,2000),1000,2000,-30,30),   // pitch
-             map(constrain(c1,1000,2000),1000,2000,-25,25),   // roll
-             map(constrain(c4,1000,2000),1000,2000,-25,25),   // yaw
-             height);
+  bool gait = (c5 >= 1500);
+  bool run = gait && fabs(sP) + fabs(sR) + fabs(sY) < 1.0f;   // gait starts once posture has eased to level
+
+  if (millis() - lcdT > 150) {                 // limit LCD refresh to ~7 Hz
+    lcdT = millis();
+    char h[17]; snprintf(h, 17, "Height: %d", height);
+    lcdPrint(gait ? "Trot Mode" : "Posture Mode", h);
   }
+
+  float tP = 0, tR = 0, tY = 0, vx = 0, vy = 0, wz = 0;
+  if (gait) {
+    if (run) {
+      vx = axis(c2, 60);                       // forward / back
+      vy = axis(c1, 60);                       // strafe
+      wz = axis(c4, 40);                       // rotate
+      float n = sqrt((vx/60)*(vx/60) + (vy/60)*(vy/60) + (wz/40)*(wz/40));
+      if (n > 1) { vx /= n; vy /= n; wz /= n; }  // keep the mix within limits
+    }
+  } else {
+    tP = map(constrain(c2,1000,2000),1000,2000,-30,30);   // pitch
+    tR = map(constrain(c1,1000,2000),1000,2000,-25,25);   // roll
+    tY = map(constrain(c4,1000,2000),1000,2000,-25,25);   // yaw
+  }
+
+  sP += (tP - sP)*k; sR += (tR - sR)*k; sY += (tY - sY)*k;
+  sHt += (height - sHt)*k;
+  sVx += (vx - sVx)*k; sVy += (vy - sVy)*k; sWz += (wz - sWz)*k;
+
+  if (run) omniTrot(30, sVx, sVy, sWz, sHt);   // gait mode
+  else     applyPRY(sP, sR, sY, sHt);         // posture mode
 }
